@@ -1,4 +1,4 @@
-import { useState } from "react";
+import React, { useState } from "react";
 import { db } from "../firebaseConfig";
 import { doc, setDoc, serverTimestamp } from "firebase/firestore";
 import "bootstrap/dist/css/bootstrap.min.css";
@@ -6,13 +6,16 @@ import "bootstrap/dist/css/bootstrap.min.css";
 export default function ProfileSetup({ user, onComplete }) {
   const [username, setUsername] = useState("");
   const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
 
   const handleSave = async (e) => {
     e.preventDefault();
     setError(null);
+    setLoading(true);
 
     if (!username.trim()) {
       setError("Kullanıcı adı boş bırakılamaz.");
+      setLoading(false);
       return;
     }
 
@@ -24,16 +27,26 @@ export default function ProfileSetup({ user, onComplete }) {
         {
           uid: user.uid,
           email: user.email,
-          username,
+          username: username.trim(),
           lastActive: serverTimestamp(),
+          isOnline: true,
         },
         { merge: true }
       );
-      console.log("User profile saved successfully!");
+      console.log("Kullanıcı profili başarıyla kaydedildi!");
       onComplete();
-    } catch (error) {
-      console.error("Error saving user profile:", error);
-      setError("Profil kaydedilirken bir hata oluştu: " + error.message);
+    } catch (err) {
+      console.error("Kullanıcı profili kaydedilirken hata oluştu:", err);
+      let errorMessage = "Profil kaydedilirken beklenmedik bir hata oluştu.";
+      if (err.message.includes("permission-denied")) {
+        errorMessage =
+          "Profilinizi kaydetmek için yetkiniz yok. Güvenlik kurallarınızı kontrol edin.";
+      } else if (err.message.includes("invalid-argument")) {
+        errorMessage = "Geçersiz veri girişi. Lütfen kontrol edin.";
+      }
+      setError(errorMessage);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -43,7 +56,7 @@ export default function ProfileSetup({ user, onComplete }) {
       style={{ maxWidth: "400px", width: "100%" }}
     >
       <h3 className="card-title text-center mb-4 text-primary">
-        Profilini Tamamla
+        Profilini Tamamla 🚀
       </h3>
       <form onSubmit={handleSave}>
         <div className="form-group mb-4">
@@ -58,6 +71,7 @@ export default function ProfileSetup({ user, onComplete }) {
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             required
+            disabled={loading}
           />
         </div>
         {error && (
@@ -65,8 +79,12 @@ export default function ProfileSetup({ user, onComplete }) {
             {error}
           </div>
         )}
-        <button type="submit" className="btn btn-primary w-100">
-          Kaydet
+        <button
+          type="submit"
+          className="btn btn-primary w-100"
+          disabled={loading}
+        >
+          {loading ? "Kaydediliyor..." : "Kaydet"}
         </button>
       </form>
     </div>

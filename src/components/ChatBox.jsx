@@ -1,5 +1,5 @@
-import { useEffect, useState, useRef } from "react";
-import { db } from "../firebaseConfig";
+import React, { useEffect, useState, useRef, useCallback } from "react";
+import { db, storage } from "../firebaseConfig";
 import {
   collection,
   addDoc,
@@ -12,193 +12,361 @@ import {
   updateDoc,
   arrayUnion,
   arrayRemove,
+  getDoc,
 } from "firebase/firestore";
-
+import {
+  ref as storageRef,
+  uploadBytes,
+  getDownloadURL,
+} from "firebase/storage";
 import { formatDistanceToNow } from "date-fns";
 import { tr } from "date-fns/locale";
+
 import "bootstrap/dist/css/bootstrap.min.css";
+import "bootstrap-icons/font/bootstrap-icons.css";
 
 const generateChatId = (uid1, uid2) => {
   return uid1 > uid2 ? uid1 + uid2 : uid2 + uid1;
 };
 
-const EMOJIS = ["👍", "❤️", "😂", "😮", "😢"];
+const EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "😡"];
 
-export default function ChatBox({ currentUser, selectedUser }) {
+export default function ChatBox({ currentUser, selectedChat, onLeaveGroup }) {
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState("");
   const [typingUsers, setTypingUsers] = useState({});
+  const [error, setError] = useState("");
+  const [leavingGroup, setLeavingGroup] = useState(false);
+
   const messagesEndRef = useRef(null);
 
-  const chatId =
-    currentUser?.uid && selectedUser?.uid
-      ? generateChatId(currentUser.uid, selectedUser.uid)
-      : null;
+  const chatContextId = selectedChat
+    ? selectedChat.type === "user"
+      ? generateChatId(currentUser.uid, selectedChat.uid)
+      : selectedChat.id
+    : null;
+
+  const chatCollectionPath = selectedChat?.type === "user" ? "chats" : "groups";
 
   useEffect(() => {
-    if (!chatId) {
+    if (!chatContextId) {
       setMessages([]);
       setTypingUsers({});
       return;
     }
 
-    const messagesRef = collection(db, "chats", chatId, "messages");
-    const q = query(messagesRef, orderBy("timestamp"));
+    setError("");
 
-    const unsubscribeMessages = onSnapshot(q, (snapshot) => {
-      const msgs = snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      }));
-      setMessages(msgs);
-    });
+    const messagesRef = collection(
+      db,
+      chatCollectionPath,
+      chatContextId,
+      "messages"
+    );
+    const messagesQuery = query(messagesRef, orderBy("timestamp"));
 
-    const chatDocRef = doc(db, "chats", chatId);
-    const unsubscribeTyping = onSnapshot(chatDocRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        setTypingUsers(data.typing || {});
-      } else {
-        setTypingUsers({});
+    const unsubscribeMessages = onSnapshot(
+      messagesQuery,
+      (snapshot) => {
+        const msgs = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+        setMessages(msgs);
+      },
+      (err) => {
+        console.error("Mesaj dinlenirken hata:", err);
+        setError("Mesajlar yüklenirken bir hata oluştu.");
       }
-    });
+    );
+
+    const chatDocRef = doc(db, chatCollectionPath, chatContextId);
+    const unsubscribeTyping = onSnapshot(
+      chatDocRef,
+      (docSnap) => {
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+
+          setTypingUsers(data.typing || {});
+        } else {
+          setTypingUsers({});
+        }
+      },
+      (err) => {
+        console.error("Yazma durumu dinlenirken hata:", err);
+        setError("Yazma durumu bilgileri yüklenemedi.");
+      }
+    );
 
     return () => {
       unsubscribeMessages();
       unsubscribeTyping();
     };
-  }, [chatId]);
+  }, [chatContextId, chatCollectionPath]);
 
   useEffect(() => {
-    if (!chatId) return;
-
-    messages.forEach(async (msg) => {
-      if (
+    const unreadMessages = messages.filter(
+      (msg) =>
         msg.sender !== currentUser.uid &&
-        !msg.readBy?.includes(currentUser.uid)
-      ) {
-        const msgRef = doc(db, "chats", chatId, "messages", msg.id);
-        await updateDoc(msgRef, {
-          readBy: arrayUnion(currentUser.uid),
-        });
-      }
-    });
-  }, [messages, chatId, currentUser.uid]);
+        (!msg.readBy || !msg.readBy.includes(currentUser.uid))
+    );
 
-  const updateTypingStatus = async (isTyping) => {
-    if (!chatId) return;
-    const chatDocRef = doc(db, "chats", chatId);
-    try {
-      await updateDoc(chatDocRef, {
-        [`typing.${currentUser.uid}`]: isTyping,
-      });
-    } catch (error) {
-      if (error.code === "not-found") {
-        await setDoc(
-          chatDocRef,
-          {
+    if (!chatContextId || unreadMessages.length === 0) return;
+
+    const markMessagesAsRead = async () => {
+      await Promise.all(
+        unreadMessages.map(async (msg) => {
+          const msgRef = doc(
+            db,
+            chatCollectionPath,
+            chatContextId,
+            "messages",
+            msg.id
+          );
+          try {
+            await updateDoc(msgRef, {
+              readBy: arrayUnion(currentUser.uid),
+            });
+          } catch (error) {
+            console.error(
+              `Mesajı okundu olarak işaretleme hatası (${msg.id}):`,
+              error
+            );
+          }
+        })
+      );
+    };
+
+    markMessagesAsRead();
+  }, [messages, chatContextId, currentUser.uid, chatCollectionPath]);
+
+  const updateTypingStatus = useCallback(
+    async (isTyping) => {
+      if (!chatContextId || !currentUser) return;
+
+      const chatDocRef = doc(db, chatCollectionPath, chatContextId);
+
+      try {
+        const docSnap = await getDoc(chatDocRef);
+
+        if (!docSnap.exists()) {
+          const initialDocData = {
             typing: {
               [currentUser.uid]: isTyping,
             },
-          },
-          { merge: true }
-        );
-      } else {
-        console.error("Typing status update error:", error);
-      }
-    }
-  };
+            createdAt: serverTimestamp(),
+          };
 
-  let typingTimeout = useRef(null);
+          if (selectedChat.type === "user") {
+            initialDocData.user1 = currentUser.uid;
+            initialDocData.user2 = selectedChat.uid;
+          } else if (selectedChat.type === "group") {
+            initialDocData.name = selectedChat.name || "Bilinmeyen Grup";
+            initialDocData.members = selectedChat.members || [currentUser.uid];
+            initialDocData.createdBy =
+              selectedChat.createdBy || currentUser.uid;
+          }
+
+          await setDoc(chatDocRef, initialDocData);
+          console.log("Sohbet/grup belgesi başarıyla oluşturuldu.");
+        } else {
+          await updateDoc(chatDocRef, {
+            [`typing.${currentUser.uid}`]: isTyping,
+          });
+        }
+      } catch (err) {
+        console.error("Yazma durumu güncelleme hatası:", err);
+      }
+    },
+    [chatContextId, chatCollectionPath, currentUser, selectedChat]
+  );
+
+  const typingTimeoutRef = useRef(null);
 
   const handleInputChange = (e) => {
     setNewMessage(e.target.value);
+
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+
     updateTypingStatus(true);
 
-    if (typingTimeout.current) {
-      clearTimeout(typingTimeout.current);
-    }
-    typingTimeout.current = setTimeout(() => {
+    typingTimeoutRef.current = setTimeout(() => {
       updateTypingStatus(false);
     }, 1000);
   };
 
   const sendMessage = async () => {
-    if (!newMessage.trim() || !chatId) return;
+    if (!newMessage.trim() || !chatContextId || !currentUser) return;
+
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+    await updateTypingStatus(false);
 
     try {
-      await addDoc(collection(db, "chats", chatId, "messages"), {
+      const messageData = {
         text: newMessage.trim(),
         sender: currentUser.uid,
-        receiver: selectedUser.uid,
+        senderName: currentUser.username || currentUser.email,
         timestamp: serverTimestamp(),
         readBy: [currentUser.uid],
         reactions: {},
-      });
+      };
 
-      await setDoc(
-        doc(db, "chats", chatId),
-        {
-          lastMessage: {
-            text: newMessage.trim(),
-            from: currentUser.uid,
-            to: selectedUser.uid,
-            timestamp: serverTimestamp(),
-          },
-          typing: {
-            [currentUser.uid]: false,
-          },
-        },
-        { merge: true }
+      if (selectedChat.type === "user") {
+        messageData.receiver = selectedChat.uid;
+      }
+
+      await addDoc(
+        collection(db, chatCollectionPath, chatContextId, "messages"),
+        messageData
       );
 
+      const lastMessageData = {
+        text: newMessage.trim(),
+        from: currentUser.uid,
+        timestamp: serverTimestamp(),
+        readBy: [currentUser.uid],
+      };
+      if (selectedChat.type === "user") {
+        lastMessageData.to = selectedChat.uid;
+      }
+
+      await updateDoc(doc(db, chatCollectionPath, chatContextId), {
+        lastMessage: lastMessageData,
+      });
+
       setNewMessage("");
-    } catch (error) {
-      console.error("Mesaj gönderilirken hata:", error);
+    } catch (err) {
+      console.error("Mesaj gönderilirken hata:", err);
+      setError("Mesaj gönderilemedi: " + err.message);
+    }
+  };
+
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file || !chatContextId || !currentUser) return;
+
+    setError("");
+
+    const fileRef = storageRef(
+      storage,
+      `${chatCollectionPath}/${chatContextId}/${Date.now()}_${file.name}`
+    );
+
+    try {
+      await uploadBytes(fileRef, file);
+      const fileURL = await getDownloadURL(fileRef);
+
+      const isImage = file.type.startsWith("image");
+      const isVideo = file.type.startsWith("video");
+
+      const messageData = {
+        mediaURL: fileURL,
+        mediaType: isImage ? "image" : isVideo ? "video" : "file",
+        sender: currentUser.uid,
+        senderName: currentUser.username || currentUser.email,
+        timestamp: serverTimestamp(),
+        readBy: [currentUser.uid],
+        reactions: {},
+      };
+
+      if (selectedChat.type === "user") {
+        messageData.receiver = selectedChat.uid;
+      }
+
+      await addDoc(
+        collection(db, chatCollectionPath, chatContextId, "messages"),
+        messageData
+      );
+
+      await updateDoc(doc(db, chatCollectionPath, chatContextId), {
+        lastMessage: {
+          text: isImage ? "📷 Fotoğraf" : isVideo ? "🎥 Video" : "📎 Dosya",
+          from: currentUser.uid,
+          timestamp: serverTimestamp(),
+          readBy: [currentUser.uid],
+          ...(selectedChat.type === "user" && { to: selectedChat.uid }),
+        },
+      });
+
+      e.target.value = null;
+    } catch (err) {
+      console.error("Medya yükleme hatası:", err);
+      setError("Dosya yüklenirken bir hata oluştu: " + err.message);
     }
   };
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (messagesEndRef.current) {
+      messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages]);
 
-  const isOtherUserTyping = Object.entries(typingUsers).some(
+  const otherTypingUsers = Object.entries(typingUsers).filter(
     ([uid, typing]) => uid !== currentUser.uid && typing === true
   );
 
-  const toggleReaction = async (msgId, emoji) => {
-    if (!chatId) return;
-    const msgRef = doc(db, "chats", chatId, "messages", msgId);
-    const msg = messages.find((m) => m.id === msgId);
-    if (!msg) return;
+  // --- Yeni: Gruptan çıkma fonksiyonu ---
+  const leaveGroup = async () => {
+    if (!selectedChat || selectedChat.type !== "group") return;
 
-    const usersReacted = msg.reactions?.[emoji] || [];
-    const hasReacted = usersReacted.includes(currentUser.uid);
+    if (
+      !window.confirm(
+        `"${selectedChat.name}" grubundan çıkmak istediğine emin misin?`
+      )
+    )
+      return;
 
+    setLeavingGroup(true);
     try {
-      if (hasReacted) {
-        await updateDoc(msgRef, {
-          [`reactions.${emoji}`]: arrayRemove(currentUser.uid),
-        });
-      } else {
-        await updateDoc(msgRef, {
-          [`reactions.${emoji}`]: arrayUnion(currentUser.uid),
-        });
-      }
+      const groupRef = doc(db, "groups", selectedChat.id);
+      await updateDoc(groupRef, {
+        members: arrayRemove(currentUser.uid),
+      });
+      setLeavingGroup(false);
+      if (onLeaveGroup) onLeaveGroup(selectedChat.id);
     } catch (error) {
-      console.error("Reaction update error:", error);
+      console.error("Gruptan çıkarken hata:", error);
+      alert("Gruptan çıkarken bir hata oluştu: " + error.message);
+      setLeavingGroup(false);
     }
   };
 
+  if (!selectedChat || !currentUser) {
+    return (
+      <div className="d-flex flex-grow-1 justify-content-center align-items-center text-muted">
+        <p>Sohbet etmek için bir kullanıcı veya grup seçin.</p>
+      </div>
+    );
+  }
+
   return (
     <div className="d-flex flex-column h-100 bg-white shadow-sm">
-      <div className="p-3 border-bottom bg-light">
-        <h5 className="mb-0 text-primary">
-          {selectedUser?.username || "Sohbet"}
+      <div className="p-3 border-bottom bg-light d-flex align-items-center">
+        <h5 className="mb-0 text-primary flex-grow-1">
+          {selectedChat.username || selectedChat.name}
+          {selectedChat.type === "group" && (
+            <span className="badge bg-info text-dark ms-2">Grup</span>
+          )}
         </h5>
+
+        {selectedChat.type === "group" && (
+          <button
+            className="btn btn-outline-danger btn-sm ms-3"
+            onClick={leaveGroup}
+            disabled={leavingGroup}
+            title="Gruptan Çık"
+          >
+            {leavingGroup ? "Çıkıyor..." : "Gruptan Çık"}
+          </button>
+        )}
       </div>
 
       <div className="flex-grow-1 p-3 overflow-auto chat-messages-container">
+        {error && <div className="alert alert-danger">{error}</div>}
         {messages.length === 0 && (
           <p className="text-center text-muted">
             Sohbet başlatmak için mesaj yazınız.
@@ -211,9 +379,10 @@ export default function ChatBox({ currentUser, selectedUser }) {
           } else if (msg.timestamp instanceof Date) {
             date = msg.timestamp;
           }
+
           const isSender = msg.sender === currentUser.uid;
           const messageBubbleClass = isSender
-            ? "bg-primary text-white ml-auto"
+            ? "bg-primary text-white ms-auto"
             : "bg-light border";
 
           return (
@@ -227,7 +396,42 @@ export default function ChatBox({ currentUser, selectedUser }) {
                 className={`p-2 rounded-lg position-relative ${messageBubbleClass}`}
                 style={{ maxWidth: "75%" }}
               >
-                {msg.text}
+                {selectedChat.type === "group" && !isSender && (
+                  <small className="text-muted d-block mb-1">
+                    {msg.senderName || "Bilinmeyen Kullanıcı"}
+                  </small>
+                )}
+
+                {msg.text && <div>{msg.text}</div>}
+                {msg.mediaURL && msg.mediaType === "image" && (
+                  <img
+                    src={msg.mediaURL}
+                    alt="Görsel"
+                    className="img-fluid rounded mt-2"
+                    style={{ maxWidth: "200px" }}
+                  />
+                )}
+                {msg.mediaURL && msg.mediaType === "video" && (
+                  <video
+                    controls
+                    className="img-fluid rounded mt-2"
+                    style={{ maxWidth: "200px" }}
+                  >
+                    <source src={msg.mediaURL} type="video/mp4" />
+                    Tarayıcınız video etiketini desteklemiyor.
+                  </video>
+                )}
+                {msg.mediaURL && msg.mediaType === "file" && (
+                  <a
+                    href={msg.mediaURL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="d-block mt-2 text-primary"
+                  >
+                    <i className="bi bi-file-earmark"></i> Dosya İndir
+                  </a>
+                )}
+
                 <div className="d-flex flex-wrap mt-2" style={{ gap: "6px" }}>
                   {EMOJIS.map((emoji) => {
                     const usersReacted = msg.reactions?.[emoji] || [];
@@ -236,18 +440,17 @@ export default function ChatBox({ currentUser, selectedUser }) {
                       <span
                         key={emoji}
                         onClick={() => toggleReaction(msg.id, emoji)}
-                        className={`badge badge-pill ${
-                          hasReacted ? "badge-primary" : "badge-secondary"
+                        className={`badge rounded-pill ${
+                          hasReacted ? "bg-info text-dark" : "bg-secondary"
                         }`}
                         style={{
                           cursor: "pointer",
-                          opacity: hasReacted ? 1 : 0.7,
+                          opacity:
+                            hasReacted || usersReacted.length > 0 ? 1 : 0.7,
                         }}
-                        title={
-                          hasReacted
-                            ? `Tepkini kaldır: ${emoji}`
-                            : `Tepki ver: ${emoji}`
-                        }
+                        title={`${emoji} ${usersReacted
+                          .map((uid) => (uid === currentUser.uid ? "Sen" : uid))
+                          .join(", ")}`}
                       >
                         {emoji}{" "}
                         {usersReacted.length > 0 ? usersReacted.length : ""}
@@ -255,6 +458,7 @@ export default function ChatBox({ currentUser, selectedUser }) {
                     );
                   })}
                 </div>
+
                 {date && (
                   <div
                     className="text-right mt-1"
@@ -263,15 +467,35 @@ export default function ChatBox({ currentUser, selectedUser }) {
                     {formatDistanceToNow(date, { addSuffix: true, locale: tr })}
                   </div>
                 )}
+
                 {isSender && (
                   <div
                     className="text-right"
                     style={{
                       fontSize: "0.7em",
-                      color: msg.readBy?.length > 1 ? "#00e676" : "#bdbdbd",
+                      color:
+                        (selectedChat.type === "user" &&
+                          msg.readBy?.length > 1) ||
+                        (selectedChat.type === "group" &&
+                          selectedChat.members &&
+                          msg.readBy?.length === selectedChat.members.length)
+                          ? "#00e676"
+                          : "#bdbdbd",
                     }}
                   >
-                    {msg.readBy?.length > 1 ? "Okundu ✓" : "Gönderildi"}
+                    {(selectedChat.type === "user" && msg.readBy?.length > 1) ||
+                    (selectedChat.type === "group" &&
+                      selectedChat.members &&
+                      msg.readBy?.length === selectedChat.members.length)
+                      ? "Okundu ✓"
+                      : "Gönderildi"}
+                    {selectedChat.type === "group" &&
+                      selectedChat.members &&
+                      msg.readBy?.length > 1 && (
+                        <span className="ms-1">
+                          ({msg.readBy.length}/{selectedChat.members.length})
+                        </span>
+                      )}
                   </div>
                 )}
               </div>
@@ -281,9 +505,15 @@ export default function ChatBox({ currentUser, selectedUser }) {
         <div ref={messagesEndRef} />
       </div>
 
-      {isOtherUserTyping && (
+      {otherTypingUsers.length > 0 && (
         <div className="p-2 text-muted font-italic border-top">
-          {selectedUser?.username} yazıyor...
+          {selectedChat.type === "user"
+            ? `${selectedChat.username || selectedChat.name} yazıyor...`
+            : `${otherTypingUsers
+                .map(([, typingStatus]) => {
+                  return "Biri";
+                })
+                .join(", ")} yazıyor...`}
         </div>
       )}
 
@@ -291,7 +521,7 @@ export default function ChatBox({ currentUser, selectedUser }) {
         <div className="input-group">
           <input
             type="text"
-            className="form-control rounded-pill mr-2"
+            className="form-control rounded-pill me-2"
             placeholder="Mesaj yaz..."
             value={newMessage}
             onChange={handleInputChange}
@@ -300,10 +530,26 @@ export default function ChatBox({ currentUser, selectedUser }) {
                 sendMessage();
               }
             }}
+            disabled={!chatContextId}
           />
+          <label
+            htmlFor="file-upload"
+            className="btn btn-outline-secondary rounded-pill me-2 mb-0 d-flex align-items-center justify-content-center"
+          >
+            <i className="bi bi-paperclip"></i>
+            <input
+              id="file-upload"
+              type="file"
+              accept="image/*,video/*,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/plain"
+              onChange={handleFileUpload}
+              className="d-none"
+              disabled={!chatContextId}
+            />
+          </label>
           <button
             onClick={sendMessage}
             className="btn btn-primary rounded-pill"
+            disabled={!newMessage.trim() || !chatContextId}
           >
             Gönder
           </button>
@@ -311,4 +557,42 @@ export default function ChatBox({ currentUser, selectedUser }) {
       </div>
     </div>
   );
+
+  // --- toggleReaction fonksiyonu burada ---
+  async function toggleReaction(msgId, emoji) {
+    if (!chatContextId || !currentUser) return;
+    setError("");
+
+    const msgRef = doc(
+      db,
+      chatCollectionPath,
+      chatContextId,
+      "messages",
+      msgId
+    );
+
+    try {
+      const msgSnap = await getDoc(msgRef);
+      if (!msgSnap.exists()) {
+        console.warn("Tepki verilmek istenen mesaj bulunamadı:", msgId);
+        return;
+      }
+      const msgData = msgSnap.data();
+      const usersReacted = msgData.reactions?.[emoji] || [];
+      const hasReacted = usersReacted.includes(currentUser.uid);
+
+      if (hasReacted) {
+        await updateDoc(msgRef, {
+          [`reactions.${emoji}`]: arrayRemove(currentUser.uid),
+        });
+      } else {
+        await updateDoc(msgRef, {
+          [`reactions.${emoji}`]: arrayUnion(currentUser.uid),
+        });
+      }
+    } catch (err) {
+      console.error("Tepki güncelleme hatası:", err);
+      setError("Tepki eklerken/kaldırırken bir hata oluştu.");
+    }
+  }
 }

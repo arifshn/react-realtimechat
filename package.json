@@ -10,10 +10,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@firebase/firestore": "^4.8.0",
     "bootstrap": "^5.3.7",
+    "bootstrap-icons": "^1.13.1",
     "date-fns": "^4.1.0",
     "firebase": "^11.10.0",
     "react": "^19.1.0",
+    "react-bootstrap": "^2.10.10",
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
